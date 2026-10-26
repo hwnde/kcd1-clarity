@@ -14,6 +14,7 @@
 #include "core/log.h"
 #include "game/renderer.h"
 #include "renderer/canary.h"
+#include "renderer/subrect_fixes.h"
 #include "renderer/mip_bias.h"
 #include "renderer/screen_size_fix.h"
 #include "renderer/shadow_noise.h"
@@ -103,6 +104,8 @@ static const screen_size_fix::Shader* g_bound_fix_vs;
 static std::vector<screen_size_fix::Shader> g_fix_cs;  // guarded by g_mutex, never reallocated (reserve)
 static ID3D11ComputeShader* g_bound_cs;             // render thread
 static const screen_size_fix::Shader* g_bound_fix_cs;
+static subrect_fixes::Shader g_bound_subrect;
+static bool g_bound_bloom_vs;
 static thread_local bool t_inside;         // our own draws do not re-enter
 
 const Status& status() { return g_status; }
@@ -171,6 +174,10 @@ static HRESULT STDMETHODCALLTYPE hk_create_pixel_shader(ID3D11Device* device, co
                                                         ID3D11ClassLinkage* linkage, ID3D11PixelShader** out) {
     HRESULT hr = o_create_pixel_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
+        {
+            ScopedInside inside;
+            subrect_fixes::on_create_ps(device, code, size, *out);
+        }
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_ps(code, size, &f)) {
             f.shader = *out;
@@ -197,6 +204,7 @@ static HRESULT STDMETHODCALLTYPE hk_create_vertex_shader(ID3D11Device* device, c
                                                          ID3D11ClassLinkage* linkage, ID3D11VertexShader** out) {
     HRESULT hr = o_create_vertex_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
+        subrect_fixes::on_create_vs(code, size, *out);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_vs(code, size, &f)) {
             f.shader = *out;
@@ -299,7 +307,35 @@ static void STDMETHODCALLTYPE hk_om_set_targets_and_uavs(ID3D11DeviceContext* ct
     o_om_set_targets_and_uavs(ctx, n, rtvs, dsv, uav_start, nuav, uavs, counts);
 }
 
-// Draws that only renderer/canary looks at.
+// Keep replacements scoped across every return in Draw and all indexed/instanced paths.
+// ScopedInside keeps our temporary PS bindings out of the engine binding cache.
+class SubrectDraw {
+  public:
+    explicit SubrectDraw(ID3D11DeviceContext* ctx) : ctx_(ctx), active_(!t_inside) {
+        if (!active_)
+            return;
+        bloom_ = g_bound_subrect.kind == subrect_fixes::Kind::Bloom && g_bound_bloom_vs;
+        ScopedInside inside;
+        state_ = subrect_fixes::before_draw(ctx, g_bound_subrect, g_bound_ps);
+    }
+    ~SubrectDraw() {
+        if (!active_)
+            return;
+        ScopedInside inside;
+        subrect_fixes::after_draw(ctx_, state_);
+        if (bloom_)
+            canary::preserve_full_target(ctx_);
+    }
+    SubrectDraw(const SubrectDraw&) = delete;
+    SubrectDraw& operator=(const SubrectDraw&) = delete;
+
+  private:
+    ID3D11DeviceContext* ctx_;
+    bool active_, bloom_ = false;
+    subrect_fixes::DrawState state_;
+};
+
+// Pad inputs before the engine draw, including draws with no other renderer fix.
 static void canary_before_draw(ID3D11DeviceContext* ctx) {
     if (t_inside)
         return;
@@ -310,18 +346,21 @@ static void canary_before_draw(ID3D11DeviceContext* ctx) {
 
 static void STDMETHODCALLTYPE hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base) {
     canary_before_draw(ctx);
+    SubrectDraw subrect(ctx);
     o_draw_indexed(ctx, count, start, base);
 }
 
 static void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, UINT count, UINT instances,
                                                         UINT start, INT base, UINT start_instance) {
     canary_before_draw(ctx);
+    SubrectDraw subrect(ctx);
     o_draw_indexed_instanced(ctx, count, instances, start, base, start_instance);
 }
 
 static void STDMETHODCALLTYPE hk_draw_instanced(ID3D11DeviceContext* ctx, UINT count, UINT instances, UINT start,
                                                 UINT start_instance) {
     canary_before_draw(ctx);
+    SubrectDraw subrect(ctx);
     o_draw_instanced(ctx, count, instances, start, start_instance);
 }
 
@@ -344,6 +383,7 @@ static void STDMETHODCALLTYPE hk_vs_set_shader(ID3D11DeviceContext* ctx, ID3D11V
                                                ID3D11ClassInstance* const* inst, UINT n) {
     if (vs != g_bound_vs && !t_inside) {
         g_bound_vs = vs;
+        g_bound_bloom_vs = subrect_fixes::is_bloom_vs(vs);
         g_bound_fix_vs = nullptr;
         if (vs) {
             std::lock_guard lock(g_mutex);
@@ -361,6 +401,7 @@ static void STDMETHODCALLTYPE hk_ps_set_shader(ID3D11DeviceContext* ctx, ID3D11P
                                                ID3D11ClassInstance* const* inst, UINT n) {
     if (ps != g_bound_ps && !t_inside) {
         g_bound_ps = ps;
+        g_bound_subrect = subrect_fixes::find_ps(ps);
         g_bound_taa = nullptr;
         g_bound_fix = nullptr;
         if (ps) {
@@ -390,6 +431,7 @@ static void STDMETHODCALLTYPE hk_ps_set_samplers(ID3D11DeviceContext* ctx, UINT 
 
 static void STDMETHODCALLTYPE hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT start) {
     canary_before_draw(ctx);  // also the TAA draw's inputs (our DLSS path reads them too)
+    SubrectDraw subrect(ctx);
     if (g_bound_taa && !t_inside)
         canary::on_taa_draw();
     if (g_bound_taa && !t_inside) {

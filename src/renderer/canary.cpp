@@ -11,6 +11,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_set>
+#include <vector>
 
 #include "core/log.h"
 #include "game/renderer.h"
@@ -30,6 +31,80 @@ static game::Vec2 g_native;
 // (texture, mip) filled since it was last bound for writing, this frame.
 static std::unordered_set<uint64_t> g_filled;
 static std::unordered_set<void*> g_textures;
+// References prevent pointer reuse until Present; a new write removes the exemption.
+static std::vector<ID3D11Resource*> g_full_layout;
+static void clear_full_layout() {
+    for (auto* r : g_full_layout)
+        r->Release();
+    g_full_layout.clear();
+}
+static void forget_full_layout(ID3D11Resource* r) {
+    auto it = std::find(g_full_layout.begin(), g_full_layout.end(), r);
+    if (it != g_full_layout.end()) {
+        (*it)->Release();
+        g_full_layout.erase(it);
+    }
+}
+static void invalidate_outputs(ID3D11DeviceContext* ctx, bool compute) {
+    if (g_full_layout.empty())
+        return;
+    if (compute) {
+        ID3D11UnorderedAccessView* views[8]{};
+        ctx->CSGetUnorderedAccessViews(0, 8, views);
+        for (auto* v : views)
+            if (v) {
+                ID3D11Resource* r = nullptr;
+                v->GetResource(&r);
+                forget_full_layout(r);
+                r->Release();
+                v->Release();
+            }
+    } else {
+        ID3D11RenderTargetView* views[8]{};
+        ctx->OMGetRenderTargets(8, views, nullptr);
+        for (auto* v : views)
+            if (v) {
+                ID3D11Resource* r = nullptr;
+                v->GetResource(&r);
+                forget_full_layout(r);
+                r->Release();
+                v->Release();
+            }
+    }
+}
+void preserve_full_target(ID3D11DeviceContext* ctx) {
+    const auto& s = taa_dlss::settings();
+    if (s.mode != taa_dlss::Mode::Dlss || s.render_scale >= .999f)
+        return;
+    ID3D11RenderTargetView* rt = nullptr;
+    ctx->OMGetRenderTargets(1, &rt, nullptr);
+    if (!rt)
+        return;
+    D3D11_RENDER_TARGET_VIEW_DESC vd;
+    rt->GetDesc(&vd);
+    ID3D11Resource* r = nullptr;
+    rt->GetResource(&r);
+    rt->Release();
+    D3D11_RESOURCE_DIMENSION dim;
+    r->GetType(&dim);
+    D3D11_TEXTURE2D_DESC td{};
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        static_cast<ID3D11Texture2D*>(r)->GetDesc(&td);
+    D3D11_VIEWPORT vp{};
+    UINT n = 1;
+    ctx->RSGetViewports(&n, &vp);
+    if (vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && vd.Texture2D.MipSlice == 0 &&
+        td.MipLevels == 1 && td.ArraySize == 1 && td.SampleDesc.Count == 1 && n == 1 && vp.TopLeftX == 0 &&
+        vp.TopLeftY == 0 && vp.Width == td.Width && vp.Height == td.Height &&
+        std::find(g_full_layout.begin(), g_full_layout.end(), r) == g_full_layout.end()) {
+        if (g_full_layout.size() >= 16)
+            clear_full_layout();
+        g_full_layout.push_back(r);
+        r = nullptr;
+    }
+    if (r)
+        r->Release();
+}
 // Views we created for filling, kept (with a reference on the texture) until the cache is flushed. nullptr: failed.
 static std::map<std::tuple<void*, UINT, DXGI_FORMAT>, ID3D11View*> g_views;
 static std::set<std::tuple<UINT, UINT, DXGI_FORMAT, UINT>> g_logged;
@@ -58,6 +133,7 @@ void on_present() {
     g_status = g_frame;
     g_frame = {};
     g_filled.clear();
+    clear_full_layout();
     g_textures.clear();
     const bool had_taa = g_taa_this_frame;
     g_taa_this_frame = false;
@@ -339,12 +415,9 @@ struct ClampFill {
         const float band = g_settings.clamp_band > 0 ? g_settings.clamp_band : 1.0f;
         const UINT bx = std::min(mw, sw + 4 + UINT(ceilf(float(mw) * band)));
         const UINT by = std::min(mh, sh + 4 + UINT(ceilf(float(mh) * band)));
-        D3D11_RECT rects[2];
-        UINT n = 0;
-        if (sw < mw)
-            rects[n++] = {LONG(sw), 0, LONG(bx), LONG(by)};
-        if (sh < mh)
-            rects[n++] = {0, LONG(sh), LONG(sw < mw ? sw : mw), LONG(by)};
+        // One viewport uses scissor slot0 only. Two rectangles leave the bottom
+        // strip unwritten; the pixel shader already discards the valid sub-rect.
+        const D3D11_RECT rect = {0, 0, LONG(bx), LONG(by)};
         StateBackup backup(ctx);
         // The texture is bound as an input: unbind the inputs before binding it for writing.
         ID3D11ShaderResourceView* null_srv[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
@@ -357,7 +430,7 @@ struct ClampFill {
         ctx->RSSetState(scissor);
         D3D11_VIEWPORT vp = {0, 0, float(mw), float(mh), 0, 1};
         ctx->RSSetViewports(1, &vp);
-        ctx->RSSetScissorRects(n, rects);
+        ctx->RSSetScissorRects(1, &rect);
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs, nullptr, 0);
@@ -516,6 +589,10 @@ static void fill_inputs(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* cons
             continue;
         ID3D11Resource* res = nullptr;
         srv->GetResource(&res);
+        if (std::find(g_full_layout.begin(), g_full_layout.end(), res) != g_full_layout.end()) {
+            res->Release();
+            continue;
+        }
         D3D11_RESOURCE_DIMENSION dim;
         res->GetType(&dim);
         D3D11_TEXTURE2D_DESC td = {};
@@ -566,6 +643,7 @@ static void fill_inputs(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* cons
 }
 
 void before_draw(ID3D11DeviceContext* ctx, DrawFn draw) {
+    invalidate_outputs(ctx, false);
     if (!on() || !g_armed || !g_status.active)
         return;
     ID3D11ShaderResourceView* srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
@@ -579,6 +657,7 @@ void before_draw(ID3D11DeviceContext* ctx, DrawFn draw) {
 }
 
 void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw) {
+    invalidate_outputs(ctx, true);
     if (!on() || !g_armed || !g_status.active)
         return;
     constexpr UINT kSlots = 32;
@@ -596,11 +675,12 @@ static void dirty(ID3D11View* view, UINT mip) {
     if (!res)
         return;
     g_filled.erase(key(res, mip));
+    forget_full_layout(res);
     res->Release();
 }
 
 void on_set_targets(UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv) {
-    if (!on() || g_filled.empty())
+    if (!on() || (g_filled.empty() && g_full_layout.empty()))
         return;
     for (UINT i = 0; rtvs && i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
         if (!rtvs[i])
@@ -620,7 +700,7 @@ void on_set_targets(UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthSten
 }
 
 void on_set_uavs(UINT n, ID3D11UnorderedAccessView* const* uavs) {
-    if (!on() || g_filled.empty())
+    if (!on() || (g_filled.empty() && g_full_layout.empty()))
         return;
     for (UINT i = 0; uavs && i < n; ++i) {
         if (!uavs[i])
@@ -633,7 +713,7 @@ void on_set_uavs(UINT n, ID3D11UnorderedAccessView* const* uavs) {
 }
 
 void after_dispatch(ID3D11DeviceContext* ctx) {
-    if (!on() || g_filled.empty())
+    if (!on() || (g_filled.empty() && g_full_layout.empty()))
         return;
     constexpr UINT kSlots = 8;
     ID3D11UnorderedAccessView* uavs[kSlots] = {};
