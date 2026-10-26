@@ -9,6 +9,7 @@
 
 #include "core/log.h"
 #include "renderer/dxbc_patch.h"
+#include "renderer/caustics_fix.h"
 #include "renderer/taa_dlss.h"
 
 namespace kc::subrect_fixes {
@@ -23,6 +24,8 @@ std::map<ID3D11PixelShader*, Entry> g_ps;
 std::map<ID3D11VertexShader*, ComPtr<ID3D11VertexShader>> g_bloom_vs;
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11Buffer> g_params;
+// Process-lifetime GPU cache: do not call D3D Release from DLL detach under the loader lock.
+CausticsDepthPatch* g_caustics = nullptr;
 
 bool hash_is(const void* code, SIZE_T size, const char* hash) {
     const auto* p = static_cast<const unsigned char*>(code);
@@ -33,6 +36,34 @@ bool hash_is(const void* code, SIZE_T size, const char* hash) {
         if (hex[p[4 + i] >> 4] != hash[i * 2] || hex[p[4 + i] & 15] != hash[i * 2 + 1])
             return false;
     return true;
+}
+// Match the reflection producer by used reflection bindings, independent of material permutations.
+bool water_reflection(const void* code, SIZE_T size) {
+    const auto* bytes = static_cast<const char*>(code);
+    constexpr char name[] = "ReflSamplerPrev";
+    bool candidate = false;
+    for (SIZE_T i = 0; i + sizeof(name) <= size; ++i)
+        if (!std::memcmp(bytes+i, name, sizeof(name))) { candidate = true; break; }
+    if (!candidate) return false;
+    ComPtr<ID3D11ShaderReflection> r;
+    if (FAILED(D3DReflect(code, size, __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(r.GetAddressOf())))) return false;
+    D3D11_SHADER_DESC desc{}; r->GetDesc(&desc);
+    // CryEngine retains identical names for the sampler and texture entries.
+    for (const char* texture : {"ReflSamplerPrev", "sceneDepthSamplerScaled"}) {
+        bool found = false;
+        for (UINT i = 0; i < desc.BoundResources; ++i) {
+            D3D11_SHADER_INPUT_BIND_DESC d{};
+            if (SUCCEEDED(r->GetResourceBindingDesc(i, &d)) && d.Type == D3D_SIT_TEXTURE &&
+                d.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && !std::strcmp(d.Name, texture)) found = true;
+        }
+        if (!found) return false;
+    }
+    for (UINT i = 0; i < desc.ConstantBuffers; ++i) {
+        auto* var = r->GetConstantBufferByIndex(i)->GetVariableByName("mViewProjPrev");
+        D3D11_SHADER_VARIABLE_DESC d{};
+        if (SUCCEEDED(var->GetDesc(&d)) && (d.uFlags & D3D_SVF_USED)) return true;
+    }
+    return false;
 }
 constexpr char kStencil[] = R"(
 Texture2D<uint2> StencilTex : register(t4);
@@ -52,6 +83,14 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
     else if (hash_is(code, size, "605729c33fe3e25d2ab7d10740ac8bab") ||
              hash_is(code, size, "84962ebe5751261dcade7dc5f97345dc"))
         kind = Kind::Bloom;
+    else if (hash_is(code, size, "4006e5a4dbb3eca402502c4ae3cdf9e7"))
+        kind = Kind::Caustics;
+    else if (hash_is(code, size, "7f6e903383ed45db5fe3d976914710a2"))
+        kind = Kind::HairOpaqueContact;
+    else if (hash_is(code, size, "c19c94272450fac6642d7abfde00d1b3"))
+        kind = Kind::HairContact;
+    if (kind == Kind::None && water_reflection(code, size))
+        kind = Kind::WaterReflection;
     if (kind == Kind::None)
         return;
     Entry entry{};
@@ -68,6 +107,13 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
     } else if (kind == Kind::Contact) {
         std::vector<uint8_t> patched;
         if (!dxbc::patch_contact_depth_uv(code, size, patched))
+            hr = E_FAIL;
+        else
+            hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
+    }
+    if (kind == Kind::HairOpaqueContact || kind == Kind::HairContact) {
+        std::vector<uint8_t> patched;
+        if (!dxbc::patch_forward_depth_origins(code, size, patched))
             hr = E_FAIL;
         else
             hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
@@ -99,12 +145,22 @@ bool is_bloom_vs(ID3D11VertexShader* shader) {
 DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader* original) {
     DrawState old;
     const auto& settings = taa_dlss::settings();
-    if (!original || !shader.replacement || settings.mode != taa_dlss::Mode::Dlss ||
+    if (!original || settings.mode != taa_dlss::Mode::Dlss ||
         settings.render_scale >= .999f)
         return old;
-    if (shader.kind == Kind::Contact) {
+    if (shader.kind == Kind::Caustics) {
+        if (!g_caustics)
+            g_caustics = new CausticsDepthPatch;
+        old.params = g_caustics->before_draw(ctx);
+        old.caustics = old.params != nullptr;
+        return old;
+    }
+    if (!shader.replacement)
+        return old;
+    const bool hair = shader.kind == Kind::HairOpaqueContact || shader.kind == Kind::HairContact;
+    if (shader.kind == Kind::Contact || hair) {
         ComPtr<ID3D11ShaderResourceView> srv;
-        ctx->PSGetShaderResources(0, 1, &srv);
+        ctx->PSGetShaderResources(hair ? (shader.kind == Kind::HairOpaqueContact ? 4 : 6) : 0, 1, &srv);
         if (!srv)
             return old;
         D3D11_SHADER_RESOURCE_VIEW_DESC vd;
@@ -126,9 +182,10 @@ DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader
         if (n != 1 || td.SampleDesc.Count != 1 || vp.TopLeftX != 0 || vp.TopLeftY != 0 || vp.Width <= 0 ||
             vp.Height <= 0 || vp.Width > td.Width || vp.Height > td.Height)
             return old;
-        float params[4] = {vp.Width / td.Width, vp.Height / td.Height, 0, 0};
-        if (params[0] >= .999f && params[1] >= .999f)
+        if (vp.Width >= td.Width * .999f && vp.Height >= td.Height * .999f)
             return old;
+        float params[4] = {hair ? float(td.Width) : vp.Width / td.Width,
+                           hair ? float(td.Height) : vp.Height / td.Height, 0, 0};
         ComPtr<ID3D11Device> device;
         ctx->GetDevice(&device);
         if (g_device.Get() != device.Get()) {
@@ -153,6 +210,11 @@ DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader
     return old;
 }
 void after_draw(ID3D11DeviceContext* ctx, DrawState& old) {
+    if (old.caustics) {
+        CausticsDepthPatch::after_draw(ctx, old.params);
+        old = {};
+        return;
+    }
     if (!old.original)
         return;
     ctx->PSSetShader(old.original, nullptr, 0);
